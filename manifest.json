@@ -1,14 +1,15 @@
 {
+  "id": "nuvio-plutonium",
   "name": "Plutonium",
-  "version": "0.2.1",
-  "description": "Pluto TV on-demand streams for Nuvio, with optional ad stripping through a LAN proxy.",
+  "version": "0.2.2",
+  "description": "Pluto TV on-demand streams for Nuvio, with Cloudflare Worker ad stripping and synced captions enabled by default.",
   "author": "maba",
   "scrapers": [
     {
       "id": "plutonium",
       "name": "Pluto TV",
-      "description": "Movies and series available on Pluto TV's free on-demand catalog. Streams are HLS; an optional LAN proxy strips Pluto's ad segments.",
-      "version": "0.2.1",
+      "description": "Movies and series available on Pluto TV's free on-demand catalog. Streams are HLS; the default Cloudflare Worker strips Pluto's ad segments and resyncs captions.",
+      "version": "0.2.2",
       "author": "maba",
       "filename": "providers/plutonium.js",
       "supportedTypes": [
