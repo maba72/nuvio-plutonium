@@ -1,0 +1,19 @@
+[Unit]
+Description=Plutonium - Pluto TV catalog and ad-free HLS for Nuvio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install the binary at %h/.local/bin/plutonium, or change this path.
+ExecStart=%h/.local/bin/plutonium --host 0.0.0.0 --port 8789 --xff 74.83.52.188
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+# Keep the cache in the user's cache directory. The default is already
+# $XDG_CACHE_HOME/nuvio-plutonium, so this is optional.
+# Environment=XDG_CACHE_HOME=%h/.cache
+# Environment=PLUTO_XFF=74.83.52.188
+
+[Install]
+WantedBy=default.target
