@@ -192,6 +192,17 @@ if you want the original Pluto stream with ads. The Python
 `proxy/pluto_proxy.py` endpoint remains supported if you point the proxy URL at
 a local instance instead.
 
+The Worker now also serves the full addon (catalogs, metadata, search and
+streams), so running this Go server is no longer necessary. To install the
+all-in-one version in Nuvio, use the addon URL instead of the scraper manifest:
+
+```text
+https://nuvio-plutonium.marc-ballegeer.workers.dev/manifest.json
+```
+
+The GitHub `manifest.json` remains a stream-only plugin for titles supplied by
+other Nuvio catalogs.
+
 ## Notes and troubleshooting
 
 - **Empty catalogs**: Pluto returns an empty category list for non-US callers.
