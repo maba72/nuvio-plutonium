@@ -201,7 +201,10 @@ https://nuvio-plutonium.marc-ballegeer.workers.dev/manifest.json
 ```
 
 The GitHub `manifest.json` remains a stream-only plugin for titles supplied by
-other Nuvio catalogs.
+other Nuvio catalogs. It resolves those titles through TMDb details and Pluto's
+own media-search service, then fetches the matching VOD slug details in one
+batched request, so general-search titles such as *The Matrix* match in about a
+second instead of relying on slug guesses.
 
 ## Notes and troubleshooting
 

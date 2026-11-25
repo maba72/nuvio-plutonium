@@ -1,13 +1,14 @@
 "use strict";
 
 var BOOT_URL = "https://boot.pluto.tv/v4/start";
-var SLUGS_URL = "https://service-vod.clusters.pluto.tv/v4/vod/slugs";
+var SEARCH_URL = "https://service-media-search.clusters.pluto.tv";
+var VOD_URL = "https://service-vod.clusters.pluto.tv";
 var TMDB_BASE = "https://api.themoviedb.org/3";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 var LOG = "[Plutonium] ";
-var MOVIE_CHUNK = 18;
-var SERIES_CHUNK = 4;
 var MAX_PTV = 12;
+var SEARCH_CANDIDATES = 8;
+var FALLBACK_LIMIT = 18;
 
 // Fallbacks for clients that have no per-scraper settings UI (for example
 // Nuvio on Android TV). Any saved scraper settings override these wholesale,
@@ -83,6 +84,19 @@ function queryString(params) {
     parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(value == null ? "" : String(value)));
   }
   return parts.join("&");
+}
+
+function tmdbRequest(path, apiKey, params) {
+  var bearer = String(apiKey).indexOf("eyJ") === 0;
+  var query = [];
+  for (var i = 0; i < params.length; i++) query.push(params[i]);
+  if (!bearer) query.push(["api_key", apiKey]);
+  var headers = { "User-Agent": UA, "Accept": "application/json" };
+  if (bearer) headers["Authorization"] = "Bearer " + apiKey;
+  return {
+    url: TMDB_BASE + path + "?" + queryString(query),
+    headers: headers
+  };
 }
 
 function uuid() {
@@ -304,12 +318,11 @@ async function getTmdbInfo(tmdbId, kind, cfg) {
     warn("TMDB API key missing");
     return null;
   }
-  var url = TMDB_BASE + "/" + kind + "/" + encodeURIComponent(tmdbId) + "?" + queryString([
-    ["api_key", key],
+  var request = tmdbRequest("/" + kind + "/" + encodeURIComponent(tmdbId), key, [
     ["language", "en-US"],
     ["append_to_response", "alternative_titles"]
   ]);
-  var data = await requestJson(url, { "User-Agent": UA, "Accept": "application/json" }, "tmdb-details");
+  var data = await requestJson(request.url, request.headers, "tmdb-details");
   if (!data || !data.id) {
     warn("TMDB details failed for " + kind + " " + tmdbId);
     return null;
@@ -323,12 +336,11 @@ async function resolveImdb(imdbId, kind, cfg) {
     warn("TMDB API key missing");
     return null;
   }
-  var url = TMDB_BASE + "/find/" + encodeURIComponent(imdbId) + "?" + queryString([
-    ["api_key", key],
+  var request = tmdbRequest("/find/" + encodeURIComponent(imdbId), key, [
     ["external_source", "imdb_id"],
     ["language", "en-US"]
   ]);
-  var data = await requestJson(url, { "User-Agent": UA, "Accept": "application/json" }, "tmdb-find");
+  var data = await requestJson(request.url, request.headers, "tmdb-find");
   if (!data) return null;
   var results = kind === "movie" ? data.movie_results : data.tv_results;
   if (!results || !results.length) return null;
@@ -360,15 +372,22 @@ async function bootPluto(cfg) {
   }
   var stitcherParams = data.stitcherParams ? String(data.stitcherParams) : "";
   stitcherParams = stitcherParams.replace(/^[?&]+/, "").replace(/&+$/, "");
+  var servers = data.servers || {};
   return {
     token: String(data.sessionToken),
     stitcher: stitcher.replace(/\/+$/, ""),
-    stitcherParams: stitcherParams
+    stitcherParams: stitcherParams,
+    search: servers.search ? String(servers.search) : SEARCH_URL,
+    vod: servers.vod ? String(servers.vod) : VOD_URL
   };
 }
 
+function vodBase(cfg) {
+  return String(cfg.vod || VOD_URL).replace(/\/+$/, "");
+}
+
 async function lookupSlugs(slugs, token, cfg) {
-  var url = SLUGS_URL + "?slugs=" + slugs.map(encodeURIComponent).join(",");
+  var url = vodBase(cfg) + "/v4/vod/slugs?slugs=" + slugs.map(encodeURIComponent).join(",");
   var headers = plutoHeaders(cfg);
   headers["Authorization"] = "Bearer " + token;
   var data = await requestJson(url, headers, "slugs");
@@ -377,6 +396,19 @@ async function lookupSlugs(slugs, token, cfg) {
     return [];
   }
   return data;
+}
+
+async function searchPluto(query, token, cfg) {
+  var base = String(cfg.search || SEARCH_URL).replace(/\/+$/, "");
+  var url = base + "/v1/search?q=" + encodeURIComponent(query);
+  var headers = plutoHeaders(cfg);
+  headers["Authorization"] = "Bearer " + token;
+  var data = await requestJson(url, headers, "search");
+  if (!data || !Array.isArray(data.data)) {
+    if (data) warn("search returned an unexpected response for " + query);
+    return [];
+  }
+  return data.data;
 }
 
 function titleList(info, includeAlternates, limit) {
@@ -481,46 +513,121 @@ function scoreItem(item, info) {
   return score;
 }
 
-function pickBest(items, info) {
+function pickBest(items, info, seasonNumber, episodeNumber) {
   var best = null;
+  var bestEpisode = null;
   var bestScore = -1;
   for (var i = 0; i < items.length; i++) {
     var score = scoreItem(items[i], info);
+    if (score < 0) continue;
+    var episodeItem = null;
+    if (info.kind === "tv") {
+      if (episodeNumber == null) continue;
+      episodeItem = findEpisode(items[i], seasonNumber, episodeNumber);
+      if (!episodeItem) continue;
+      score += 20;
+    }
     if (score > bestScore) {
       best = items[i];
+      bestEpisode = episodeItem;
       bestScore = score;
     }
   }
-  return bestScore >= 80 ? best : null;
+  return bestScore >= 80 ? { item: best, episode: bestEpisode } : null;
 }
 
-function dedupeGroups(groups) {
-  var out = [];
-  var seen = Object.create(null);
-  for (var i = 0; i < groups.length; i++) {
-    var group = [];
-    for (var j = 0; j < groups[i].length; j++) {
-      var slug = groups[i][j];
-      if (!slug || seen[slug]) continue;
-      seen[slug] = true;
-      group.push(slug);
+function scoreSearchRow(row, info) {
+  if (!row || !row.slug) return -1;
+  var type = String(row.type || "");
+  if (info.kind === "movie" && type !== "movie") return -1;
+  if (info.kind === "tv" && type !== "series") return -1;
+  var name = normalizeTitle(row.name);
+  if (!name) return -1;
+  var score = matchScore(name, normalizeTitle(info.title));
+  if (!score) score = matchScore(name, normalizeTitle(info.originalTitle));
+  if (!score) {
+    for (var i = 0; i < info.altNormalized.length; i++) {
+      var altScore = matchScore(name, info.altNormalized[i]);
+      if (altScore > score) score = altScore;
     }
-    if (group.length) out.push(group);
+  }
+  if (!score) return -1;
+  var year = itemYear(row);
+  if (year && info.year) {
+    var diff = Math.abs(year - info.year);
+    if (diff === 0) score += 10;
+    else if (diff === 1) score += 5;
+    else if (diff <= 3) score -= 5;
+    else score -= 15;
+  }
+  return score;
+}
+
+function searchCandidates(rows, info) {
+  var scored = [];
+  var seen = Object.create(null);
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var slug = row && row.slug ? String(row.slug) : "";
+    if (!slug || seen[slug]) continue;
+    var score = scoreSearchRow(row, info);
+    if (score < 60) continue;
+    seen[slug] = true;
+    scored.push({ row: row, score: score });
+  }
+  scored.sort(function (a, b) { return b.score - a.score; });
+  var out = [];
+  for (var j = 0; j < scored.length && j < SEARCH_CANDIDATES; j++) out.push(scored[j].row);
+  return out;
+}
+
+async function safeSearch(query, token, cfg) {
+  try {
+    return await searchPluto(query, token, cfg);
+  } catch (e) {
+    warn("search failed for " + query + ": " + (e && e.message ? e.message : e));
+    return [];
+  }
+}
+
+function fallbackSlugs(info) {
+  var titles = titleList(info, true, 2);
+  var out = [];
+  if (info.kind === "movie") {
+    if (!info.year) return out;
+    var movies = movieCandidatesFor(titles, [info.year, info.year - 1, info.year + 1]);
+    for (var i = 0; i < movies.length && out.length < FALLBACK_LIMIT; i++) pushUnique(out, movies[i]);
+  } else {
+    var series = seriesCandidatesFor(titles, 2);
+    for (var j = 0; j < series.length && out.length < FALLBACK_LIMIT; j++) pushUnique(out, series[j]);
   }
   return out;
 }
 
-async function findMatch(groups, info, token, cfg) {
-  var chunkSize = info.kind === "movie" ? MOVIE_CHUNK : SERIES_CHUNK;
-  for (var g = 0; g < groups.length; g++) {
-    var group = groups[g];
-    for (var i = 0; i < group.length; i += chunkSize) {
-      var chunk = group.slice(i, i + chunkSize);
-      debugLog(cfg, "lookup " + info.kind + " slugs: " + chunk.join(","));
-      var items = await lookupSlugs(chunk, token, cfg);
-      var best = pickBest(items, info);
-      if (best) return best;
-    }
+async function findBestMatch(info, seasonNumber, episodeNumber, token, cfg) {
+  var queries = titleList(info, true, 3);
+  var lists = await Promise.all(queries.map(function (query) {
+    return safeSearch(query, token, cfg);
+  }));
+  var rows = [];
+  for (var i = 0; i < lists.length; i++) {
+    for (var j = 0; j < lists[i].length; j++) rows.push(lists[i][j]);
+  }
+
+  var candidates = searchCandidates(rows, info);
+  var slugs = [];
+  for (var c = 0; c < candidates.length; c++) slugs.push(String(candidates[c].slug));
+  debugLog(cfg, "search " + info.title + " -> " + slugs.length + " candidate slug(s)");
+  var items = slugs.length ? await lookupSlugs(slugs, token, cfg) : [];
+  var match = pickBest(items, info, seasonNumber, episodeNumber);
+  if (match) return match;
+
+  var fallback = fallbackSlugs(info);
+  if (fallback.length) {
+    debugLog(cfg, "fallback " + info.kind + " slugs: " + fallback.join(","));
+    var fallbackItems = await lookupSlugs(fallback, token, cfg);
+    match = pickBest(fallbackItems, info, seasonNumber, episodeNumber);
+    if (match) return match;
   }
   return null;
 }
@@ -608,15 +715,21 @@ async function getStreams(tmdbId, mediaType, season, episode) {
         return [];
       }
     }
-    var info = await getTmdbInfo(id, kind, settings);
-    if (!info) return [];
     var seasonNumber = kind === "tv" ? toInt(season) : null;
     var episodeNumber = kind === "tv" ? toInt(episode) : null;
     if (kind === "tv" && episodeNumber == null) {
       warn("missing episode number");
       return [];
     }
-    var boot = await bootPluto(settings);
+
+    // TMDb details and Pluto boot are independent, so start both at once.
+    var startup = await Promise.all([
+      getTmdbInfo(id, kind, settings),
+      bootPluto(settings)
+    ]);
+    var info = startup[0];
+    var boot = startup[1];
+    if (!info) return [];
     if (!boot) {
       geoHint(settings);
       return [];
@@ -624,69 +737,24 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     settings.token = boot.token;
     settings.stitcher = boot.stitcher;
     settings.stitcherParams = boot.stitcherParams;
+    settings.search = boot.search;
+    settings.vod = boot.vod;
 
-    var groups;
-    if (kind === "movie") {
-      if (!info.year) {
-        warn("no release year for movie " + id);
-        return [];
-      }
-      var primaryMovies = titleList(info, false);
-      var alternateMovies = titleList(info, true, 6);
-      var primaryOnly = [];
-      for (var p = 0; p < primaryMovies.length; p++) primaryOnly.push(primaryMovies[p]);
-      var alternatesOnly = [];
-      for (var a = 0; a < alternateMovies.length; a++) {
-        var seenPrimary = false;
-        for (var q = 0; q < primaryMovies.length; q++) {
-          if (normalizeTitle(alternateMovies[a]) === normalizeTitle(primaryMovies[q])) {
-            seenPrimary = true;
-            break;
-          }
-        }
-        if (!seenPrimary) alternatesOnly.push(alternateMovies[a]);
-      }
-      groups = [
-        movieCandidatesFor(primaryOnly, [info.year]),
-        movieCandidatesFor(primaryOnly, [info.year - 1, info.year + 1]).concat(movieCandidatesFor(alternatesOnly, [info.year])),
-        movieCandidatesFor(alternatesOnly, [info.year - 1, info.year + 1])
-      ];
-    } else {
-      var primarySeries = titleList(info, false);
-      var alternateSeries = titleList(info, true, 3);
-      var primarySeriesOnly = [];
-      for (var ps = 0; ps < primarySeries.length; ps++) primarySeriesOnly.push(primarySeries[ps]);
-      var alternateSeriesOnly = [];
-      for (var as = 0; as < alternateSeries.length; as++) {
-        var seen = false;
-        for (var pr = 0; pr < primarySeries.length; pr++) {
-          if (normalizeTitle(alternateSeries[as]) === normalizeTitle(primarySeries[pr])) {
-            seen = true;
-            break;
-          }
-        }
-        if (!seen) alternateSeriesOnly.push(alternateSeries[as]);
-      }
-      groups = [
-        seriesCandidatesFor(primarySeriesOnly, 2),
-        seriesCandidatesFor(alternateSeriesOnly, 2)
-      ];
-    }
-    var match = await findMatch(dedupeGroups(groups), info, boot.token, settings);
+    var match = await findBestMatch(info, seasonNumber, episodeNumber, boot.token, settings);
     if (!match) {
       warn("no Pluto match for " + info.title + " (" + kind + " " + id + ")");
       geoHint(settings);
       return [];
     }
-    debugLog(settings, "matched " + match.type + " slug " + match.slug + " (" + match.name + ")");
+    debugLog(settings, "matched " + match.item.type + " slug " + match.item.slug + " (" + match.item.name + ")");
 
     if (kind === "movie") {
-      if (!match._id) return [];
-      return [buildStream(match._id, settings)];
+      if (!match.item._id) return [];
+      return [buildStream(match.item._id, settings)];
     }
-    var episodeItem = findEpisode(match, seasonNumber, episodeNumber);
+    var episodeItem = match.episode;
     if (!episodeItem || !episodeItem._id) {
-      warn("episode S" + seasonNumber + "E" + episodeNumber + " not found in " + match.slug);
+      warn("episode S" + seasonNumber + "E" + episodeNumber + " not found in " + match.item.slug);
       return [];
     }
     debugLog(settings, "episode " + episodeItem.slug + " (" + episodeItem.name + ")");
